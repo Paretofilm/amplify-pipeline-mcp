@@ -1,0 +1,104 @@
+# Notification Templates for Amplify Pipeline
+
+# SLACK NOTIFICATION
+  notify-slack:
+    if: always()
+    needs: [deploy]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Send Slack notification
+        uses: 8398a7/action-slack@v3
+        with:
+          status: ${{ job.status }}
+          text: |
+            Deployment ${{ job.status == 'success' && '✅ Succeeded' || '❌ Failed' }}
+            Branch: ${{ github.ref_name }}
+            Commit: ${{ github.event.head_commit.message }}
+            Author: ${{ github.actor }}
+          webhook_url: ${{ secrets.SLACK_WEBHOOK_URL }}
+        if: env.SLACK_WEBHOOK_URL != ''
+
+# DISCORD NOTIFICATION
+  notify-discord:
+    if: always()
+    needs: [deploy]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Send Discord notification
+        env:
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: |
+          if [ -n "$DISCORD_WEBHOOK" ]; then
+            STATUS="${{ needs.deploy.result }}"
+            COLOR=$([ "$STATUS" = "success" ] && echo "3066993" || echo "15158332")
+            
+            curl -H "Content-Type: application/json" \
+              -X POST \
+              -d "{
+                \"embeds\": [{
+                  \"title\": \"🚀 Deployment $STATUS\",
+                  \"color\": $COLOR,
+                  \"fields\": [
+                    {\"name\": \"Branch\", \"value\": \"${{ github.ref_name }}\", \"inline\": true},
+                    {\"name\": \"Author\", \"value\": \"${{ github.actor }}\", \"inline\": true},
+                    {\"name\": \"Commit\", \"value\": \"${{ github.event.head_commit.message }}\"}
+                  ],
+                  \"timestamp\": \"$(date -u +%Y-%m-%dT%H:%M:%S.000Z)\"
+                }]
+              }" \
+              $DISCORD_WEBHOOK
+          fi
+
+# EMAIL NOTIFICATION (using AWS SES)
+  notify-email:
+    if: failure()
+    needs: [deploy]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Send failure email
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          EMAIL_TO: ${{ secrets.NOTIFICATION_EMAIL }}
+        run: |
+          if [ -n "$EMAIL_TO" ]; then
+            aws ses send-email \
+              --from "noreply@yourdomain.com" \
+              --to "$EMAIL_TO" \
+              --subject "❌ Deployment Failed: ${{ github.repository }}" \
+              --text "Deployment failed for branch ${{ github.ref_name }}. 
+                      
+                      Repository: ${{ github.repository }}
+                      Branch: ${{ github.ref_name }}
+                      Commit: ${{ github.sha }}
+                      Author: ${{ github.actor }}
+                      Message: ${{ github.event.head_commit.message }}
+                      
+                      View details: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          fi
+
+# CUSTOM WEBHOOK
+  notify-webhook:
+    if: always()
+    needs: [deploy]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Send custom webhook
+        env:
+          WEBHOOK_URL: ${{ secrets.CUSTOM_WEBHOOK_URL }}
+        run: |
+          if [ -n "$WEBHOOK_URL" ]; then
+            curl -X POST "$WEBHOOK_URL" \
+              -H "Content-Type: application/json" \
+              -d '{
+                "event": "deployment",
+                "status": "${{ needs.deploy.result }}",
+                "repository": "${{ github.repository }}",
+                "branch": "${{ github.ref_name }}",
+                "commit": "${{ github.sha }}",
+                "author": "${{ github.actor }}",
+                "message": "${{ github.event.head_commit.message }}",
+                "workflow_url": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}",
+                "timestamp": "'"$(date -u +%Y-%m-%dT%H:%M:%S.000Z)"'"
+              }'
+          fi

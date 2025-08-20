@@ -1,0 +1,139 @@
+# Amplify Pipeline MCP Server - Development Guide
+
+## Project Overview
+This is an MCP (Model Context Protocol) server that automates the setup of custom CI/CD pipelines for AWS Amplify Gen 2 applications. It replaces Amplify's auto-build with custom pipelines (GitHub Actions, CodePipeline, etc.).
+
+## Core Functionality
+The server provides tools to:
+1. Disable auto-build for Amplify branches
+2. Create webhooks for triggering frontend builds
+3. Generate amplify.yml build specifications
+4. Create GitHub Actions workflows
+5. Auto-detect app IDs and branches from repositories
+
+## Architecture
+- `server.py`: Main MCP server implementation
+- Uses AWS CLI commands via subprocess (not boto3) for simplicity
+- Auto-detection logic checks multiple sources for app ID
+- Generates files locally for user to commit
+
+## Key Components
+
+### AmplifyPipelineManager Class
+- `run_command()`: Executes AWS CLI and git commands
+- `get_current_branch()`: Detects current Git branch
+- `find_app_id_from_repo()`: Auto-detects Amplify app ID from:
+  - `.amplify/deployment-state.json` (Gen 2)
+  - `amplify/team-provider-info.json` (Gen 1)
+  - Git remote URL matching with AWS Amplify apps
+- `disable_auto_build()`: Uses `aws amplify update-branch`
+- `create_webhook()`: Creates webhook and saves info locally
+- `update_build_spec()`: Generates amplify.yml for custom pipelines
+- `setup_github_workflow()`: Creates GitHub Actions workflow
+- `setup_custom_pipeline()`: Orchestrates all steps
+
+### MCP Tools Exposed
+- `setup_custom_pipeline`: Full setup with optional auto-detection
+- `quick_setup`: One-click setup using all auto-detection
+- `disable_auto_build`: Disable auto-build only
+- `create_webhook`: Create webhook only
+- `get_app_info`: Get Amplify app information
+
+## Important Context
+- Default AWS region: `eu-north-1` (configured for user's preference)
+- Uses `npx ampx pipeline-deploy` command for backend deployment
+- Frontend builds triggered via webhook after backend deployment
+- GitHub Actions workflow uses secrets for AWS credentials
+
+## Development Setup
+
+### Install for Development (with auto-reload)
+```bash
+# Install with nodemon for auto-reload during development
+npm install -g nodemon
+claude mcp add amplify-pipeline-dev "nodemon --exec python /Users/kjetilge/mcp-servers/amplify-pipeline-mcp/server.py"
+```
+
+### Install for Testing (stable)
+```bash
+claude mcp add amplify-pipeline "python /Users/kjetilge/mcp-servers/amplify-pipeline-mcp/server.py"
+```
+
+## Testing the Server
+1. Create a test Amplify app connected to GitHub
+2. Navigate to the repository
+3. Run `claude` and test: "Set up a custom pipeline for this app"
+4. Verify files are created and AWS resources are configured
+
+## Common Development Tasks
+
+### Adding a New Tool
+1. Add tool definition in `list_tools()`
+2. Implement logic in `AmplifyPipelineManager` class
+3. Add handler in `call_tool()`
+4. Update README with new functionality
+
+### Debugging
+- Check `~/.amplify-webhook-*.json` files for webhook info
+- Use `aws amplify get-app --app-id <id>` to verify app state
+- Check GitHub Actions logs for pipeline issues
+- Use `logger.info()` for debugging output
+
+### Error Handling Patterns
+- Always return structured dicts with 'success' and 'error' keys
+- Provide helpful error messages with hints
+- Check command success before parsing output
+- Handle JSON parsing errors gracefully
+
+## AWS CLI Commands Used
+- `aws amplify get-app`: Get app information
+- `aws amplify list-apps`: List all Amplify apps
+- `aws amplify update-branch`: Update branch settings
+- `aws amplify create-webhook`: Create webhook
+- `git rev-parse --abbrev-ref HEAD`: Get current branch
+- `git remote get-url origin`: Get repository URL
+
+## Files Generated
+- `.amplify-webhook-{app-id}-{branch}.json`: Webhook information
+- `amplify-buildspec-{app-id}.yml`: Build specification
+- `.github/workflows/amplify-pipeline-{branch}.yml`: GitHub Actions workflow
+
+## Known Issues & TODOs
+- [ ] Add support for other CI/CD systems (CodePipeline, CodeCatalyst)
+- [ ] Implement webhook test/validation command
+- [ ] Add rollback functionality
+- [ ] Support for monorepo setups
+- [ ] Better error messages when AWS CLI is not configured
+- [ ] Add dry-run mode for testing
+
+## Dependencies
+- Python 3.8+
+- mcp package
+- pyyaml package
+- AWS CLI (configured with credentials)
+- Git (for branch detection)
+
+## Security Considerations
+- Never commit AWS credentials
+- Webhook URLs contain tokens - handle carefully
+- GitHub secrets used for AWS credentials in workflows
+- App IDs are not sensitive but repository URLs might be
+
+## Future Enhancements
+1. Support for environment-specific pipelines
+2. Pipeline status monitoring
+3. Automated rollback on failure
+4. Cost estimation for pipeline runs
+5. Integration with AWS CodeGuru for code reviews
+
+## Useful Resources
+- [AWS Amplify Custom Pipelines Docs](https://docs.amplify.aws/react/deploy-and-host/fullstack-branching/custom-pipelines/)
+- [MCP Protocol Specification](https://modelcontextprotocol.io)
+- [AWS CLI Amplify Reference](https://docs.aws.amazon.com/cli/latest/reference/amplify/)
+
+## Development Philosophy
+- Prioritize auto-detection to minimize user input
+- Fail gracefully with helpful error messages
+- Generate files locally for user control
+- Use AWS CLI for compatibility and simplicity
+- Keep the MCP server stateless

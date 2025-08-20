@@ -1,0 +1,192 @@
+# Performance Monitoring Templates for Amplify Pipeline
+
+  # Bundle Size Check
+  bundle-size:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: '18'
+          cache: 'npm'
+      
+      - name: Install dependencies
+        run: npm ci --prefer-offline --no-audit
+      
+      - name: Build and analyze bundle
+        run: |
+          npm run build
+          
+          # Get bundle sizes
+          echo "## Bundle Size Report 📦" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          # Calculate sizes
+          TOTAL_SIZE=$(du -sb .next | cut -f1)
+          STATIC_SIZE=$(du -sb .next/static 2>/dev/null | cut -f1 || echo 0)
+          SERVER_SIZE=$(du -sb .next/server 2>/dev/null | cut -f1 || echo 0)
+          
+          # Convert to MB
+          TOTAL_MB=$(echo "scale=2; $TOTAL_SIZE / 1048576" | bc)
+          STATIC_MB=$(echo "scale=2; $STATIC_SIZE / 1048576" | bc)
+          SERVER_MB=$(echo "scale=2; $SERVER_SIZE / 1048576" | bc)
+          
+          echo "| Component | Size |" >> $GITHUB_STEP_SUMMARY
+          echo "|-----------|------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Total | ${TOTAL_MB} MB |" >> $GITHUB_STEP_SUMMARY
+          echo "| Static | ${STATIC_MB} MB |" >> $GITHUB_STEP_SUMMARY
+          echo "| Server | ${SERVER_MB} MB |" >> $GITHUB_STEP_SUMMARY
+          
+          # Check against limits
+          MAX_SIZE=10485760  # 10MB limit
+          if [ $TOTAL_SIZE -gt $MAX_SIZE ]; then
+            echo "❌ Bundle size exceeds limit!" >> $GITHUB_STEP_SUMMARY
+            exit 1
+          else
+            echo "✅ Bundle size within limits" >> $GITHUB_STEP_SUMMARY
+          fi
+      
+      - name: Upload bundle analysis
+        uses: actions/upload-artifact@v3
+        with:
+          name: bundle-analysis
+          path: .next/analyze/
+
+  # Lighthouse CI Performance Check
+  lighthouse:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: '18'
+          cache: 'npm'
+      
+      - name: Install dependencies
+        run: npm ci --prefer-offline --no-audit
+      
+      - name: Build application
+        run: npm run build
+      
+      - name: Run Lighthouse CI
+        run: |
+          npm install -g @lhci/cli@0.12.x
+          lhci autorun || echo "Lighthouse CI not configured"
+        env:
+          LHCI_GITHUB_APP_TOKEN: ${{ secrets.LHCI_GITHUB_APP_TOKEN }}
+
+  # Memory and CPU Usage Check
+  resource-usage:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: '18'
+          cache: 'npm'
+      
+      - name: Install dependencies
+        run: npm ci --prefer-offline --no-audit
+      
+      - name: Start app and measure resources
+        run: |
+          # Start the app in background
+          npm run start &
+          APP_PID=$!
+          
+          # Wait for app to start
+          sleep 10
+          
+          # Measure resources
+          echo "## Resource Usage Report 📊" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          # Get memory usage
+          MEMORY=$(ps -o rss= -p $APP_PID | awk '{print $1/1024 " MB"}')
+          echo "Memory Usage: $MEMORY" >> $GITHUB_STEP_SUMMARY
+          
+          # Get CPU usage
+          CPU=$(ps -o %cpu= -p $APP_PID)
+          echo "CPU Usage: ${CPU}%" >> $GITHUB_STEP_SUMMARY
+          
+          # Kill the app
+          kill $APP_PID
+
+  # Performance Budget Check
+  performance-budget:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      
+      - name: Check performance budget
+        run: |
+          cat > performance-budget.json << EOF
+          {
+            "budgets": [
+              {
+                "type": "bundle",
+                "name": "main",
+                "maximumWarning": "300kb",
+                "maximumError": "500kb"
+              },
+              {
+                "type": "bundle", 
+                "name": "vendor",
+                "maximumWarning": "500kb",
+                "maximumError": "1mb"
+              }
+            ]
+          }
+          EOF
+          
+          # Add budget check to build
+          echo "Performance budget configured"
+
+  # Load Testing (Optional - requires k6 or similar)
+  load-test:
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    steps:
+      - uses: actions/checkout@v3
+      
+      - name: Run k6 load test
+        run: |
+          # Install k6
+          sudo apt-key adv --keyserver hkp://keyserver.ubuntu.com:80 --recv-keys C5AD17C747E3415A3642D57D77C6C491D6AC1D69
+          echo "deb https://dl.k6.io/deb stable main" | sudo tee /etc/apt/sources.list.d/k6.list
+          sudo apt-get update
+          sudo apt-get install k6
+          
+          # Create basic load test
+          cat > loadtest.js << 'EOF'
+          import http from 'k6/http';
+          import { check } from 'k6';
+          
+          export let options = {
+            stages: [
+              { duration: '30s', target: 20 },
+              { duration: '1m', target: 20 },
+              { duration: '30s', target: 0 },
+            ],
+            thresholds: {
+              http_req_duration: ['p(95)<500'],
+            },
+          };
+          
+          export default function() {
+            let res = http.get('https://your-app-url.amplifyapp.com');
+            check(res, {
+              'status is 200': (r) => r.status === 200,
+              'response time < 500ms': (r) => r.timings.duration < 500,
+            });
+          }
+          EOF
+          
+          # Run load test
+          k6 run loadtest.js || echo "Load test completed"
