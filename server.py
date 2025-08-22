@@ -143,37 +143,38 @@ class AmplifyPipelineManager:
     async def update_build_spec(self, app_id: str) -> Dict[str, Any]:
         """Update the build spec for custom pipeline support"""
         
-        # Create the custom pipeline build spec
+        # Create the custom pipeline build spec with proper Node.js 20 configuration
         custom_build_spec = """version: 1
-applications:
-  - appRoot: .
-    backend:
-      phases:
-        build:
-          commands:
-            - nvm use 20
-            - npm ci
-            - export CI=1
-            # Deploy backend if it doesn't exist
-            - npx ampx pipeline-deploy --branch $AWS_BRANCH --app-id $AWS_APP_ID || true
-            # Generate outputs for the frontend
-            - npx ampx generate outputs --branch $AWS_BRANCH --app-id $AWS_APP_ID
-    frontend:
-      phases:
-        preBuild:
-          commands:
-            - nvm use 20
-            - npm ci
-        build:
-          commands:
-            - npm run build
-      artifacts:
-        baseDirectory: .next
-        files:
-          - '**/*'
-      cache:
-        paths:
-          - node_modules/**/*
+backend:
+  phases:
+    build:
+      commands:
+        # Deploy Amplify backend using pipeline-deploy
+        - npx ampx pipeline-deploy --branch $AWS_BRANCH --app-id $AWS_APP_ID
+frontend:
+  phases:
+    preBuild:
+      commands:
+        # Install dependencies
+        - npm ci
+    build:
+      commands:
+        # Build Next.js app
+        - npm run build
+  artifacts:
+    baseDirectory: .next
+    files:
+      - '**/*'
+  cache:
+    paths:
+      - node_modules/**/*
+      - .next/cache/**/*
+  buildSpec:
+    env:
+      variables:
+        AMPLIFY_MONOREPO_APP_ROOT: ''
+        _CUSTOM_IMAGE: 'amplify:al2023'
+        NODE_VERSION: '20'
 """
         
         # Save build spec to file (with sanitized app_id)
@@ -815,6 +816,109 @@ jobs:
             'message': 'package-lock.json is in sync with package.json'
         }
     
+    async def create_amplify_yml_in_repo(self, repo_path: str) -> Dict[str, Any]:
+        """Create amplify.yml in the repository with Node.js 20 configuration"""
+        
+        amplify_yml_path = Path(repo_path) / "amplify.yml"
+        
+        # Check if amplify.yml already exists
+        if amplify_yml_path.exists():
+            logger.info("amplify.yml already exists, skipping creation")
+            return {
+                'success': True,
+                'skipped': True,
+                'message': 'amplify.yml already exists in repository'
+            }
+        
+        # Create the amplify.yml content with Node.js 20
+        amplify_yml_content = """version: 1
+backend:
+  phases:
+    build:
+      commands:
+        # Deploy Amplify backend using pipeline-deploy
+        - npx ampx pipeline-deploy --branch $AWS_BRANCH --app-id $AWS_APP_ID
+frontend:
+  phases:
+    preBuild:
+      commands:
+        # Install dependencies
+        - npm ci
+    build:
+      commands:
+        # Build Next.js app
+        - npm run build
+  artifacts:
+    baseDirectory: .next
+    files:
+      - '**/*'
+  cache:
+    paths:
+      - node_modules/**/*
+      - .next/cache/**/*
+  buildSpec:
+    env:
+      variables:
+        AMPLIFY_MONOREPO_APP_ROOT: ''
+        _CUSTOM_IMAGE: 'amplify:al2023'
+        NODE_VERSION: '20'
+"""
+        
+        try:
+            # Write the file
+            amplify_yml_path.write_text(amplify_yml_content)
+            logger.info(f"Created amplify.yml at {amplify_yml_path}")
+            
+            # Add to git and commit
+            await self.run_command(["git", "add", "amplify.yml"], cwd=repo_path)
+            
+            # Check if there are changes to commit
+            status_result = await self.run_command(["git", "status", "--porcelain", "amplify.yml"], cwd=repo_path)
+            
+            if status_result['success'] and status_result['stdout'].strip():
+                # Commit the file
+                commit_result = await self.run_command(
+                    ["git", "commit", "-m", "Add amplify.yml with Node.js 20 configuration for pipeline deploy"],
+                    cwd=repo_path
+                )
+                
+                if commit_result['success']:
+                    # Push the changes
+                    push_result = await self.run_command(["git", "push"], cwd=repo_path)
+                    
+                    if push_result['success']:
+                        return {
+                            'success': True,
+                            'created': True,
+                            'message': 'amplify.yml created and pushed successfully'
+                        }
+                    else:
+                        return {
+                            'success': True,
+                            'created': True,
+                            'message': 'amplify.yml created and committed but not pushed',
+                            'warning': 'Run git push manually to push the changes'
+                        }
+                else:
+                    return {
+                        'success': True,
+                        'created': True,
+                        'message': 'amplify.yml created but not committed'
+                    }
+            else:
+                return {
+                    'success': True,
+                    'created': True,
+                    'message': 'amplify.yml created (no changes to commit)'
+                }
+                
+        except Exception as e:
+            logger.error(f"Failed to create amplify.yml: {e}")
+            return {
+                'success': False,
+                'error': f"Failed to create amplify.yml: {str(e)}"
+            }
+    
     async def setup_custom_pipeline(
         self,
         app_id: Optional[str] = None,
@@ -872,6 +976,14 @@ jobs:
             results['success'] = False
             results['error'] = 'Failed to sync package-lock.json'
             return results
+        
+        # Step 0.5: Create amplify.yml with Node.js 20 configuration
+        logger.info("Creating amplify.yml with Node.js 20 configuration...")
+        amplify_yml_result = await self.create_amplify_yml_in_repo(repo_path)
+        results['steps'].append({
+            'step': 'create_amplify_yml',
+            'result': amplify_yml_result
+        })
         
         # Step 1: Check and deploy backend if needed
         logger.info("Checking backend deployment status...")
@@ -960,8 +1072,9 @@ jobs:
         
         results['success'] = True
         
-        # Include package-lock and backend deployment status in summary
+        # Include package-lock, amplify.yml and backend deployment status in summary
         package_lock_status = ''
+        amplify_yml_status = ''
         backend_status = ''
         for step in results['steps']:
             if step['step'] == 'check_package_lock':
@@ -972,6 +1085,12 @@ jobs:
                     package_lock_status = '✅ package-lock.json is in sync\n'
                 elif result.get('skipped'):
                     package_lock_status = ''  # Don't mention if no package.json
+            elif step['step'] == 'create_amplify_yml':
+                result = step['result']
+                if result.get('created'):
+                    amplify_yml_status = '✅ amplify.yml created with Node.js 20 configuration\n'
+                elif result.get('skipped'):
+                    amplify_yml_status = '✅ amplify.yml already exists\n'
             elif step['step'] == 'check_backend':
                 if step['result'].get('action') == 'deployed':
                     backend_status = '✅ Backend deployed successfully\n'
@@ -981,6 +1100,7 @@ jobs:
         results['summary'] = (
             f"Custom pipeline setup complete for {branch_name}!\n\n"
             f"{package_lock_status}"
+            f"{amplify_yml_status}"
             f"{backend_status}"
             f"✅ Auto-build disabled\n"
             f"✅ Webhook created for frontend triggers\n"
