@@ -18,6 +18,7 @@ import asyncio
 from mcp.server import Server
 import mcp.types as types
 import mcp.server.stdio
+from workflow_template import get_workflow_template
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -150,14 +151,18 @@ applications:
       phases:
         build:
           commands:
+            - nvm use 20
             - npm ci
             - export CI=1
+            # Deploy backend if it doesn't exist
+            - npx ampx pipeline-deploy --branch $AWS_BRANCH --app-id $AWS_APP_ID || true
             # Generate outputs for the frontend
             - npx ampx generate outputs --branch $AWS_BRANCH --app-id $AWS_APP_ID
     frontend:
       phases:
         preBuild:
           commands:
+            - nvm use 20
             - npm ci
         build:
           commands:
@@ -412,7 +417,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v3
         with:
-          node-version: '18'
+          node-version: '20'
           cache: 'npm'
       
       - name: Install dependencies
@@ -483,134 +488,8 @@ jobs:
             except Exception as e:
                 logger.warning(f"Could not read webhook file: {e}")
         
-        # Escape branch name for shell commands
-        escaped_branch = branch_name.replace('"', '\\"').replace('$', '\\$')
-        
-        # Create workflow with proper GitHub Actions syntax
-        workflow = f"""name: Amplify Backend Pipeline
-
-on:
-  push:
-    branches: [{branch_name}]
-    paths-ignore:
-      - '**.md'
-      - 'docs/**'
-
-permissions:
-  contents: write
-
-concurrency:
-  group: amplify-deploy-${{{{ github.ref }}}}
-  cancel-in-progress: true
-
-jobs:
-  deploy:
-    runs-on: ubuntu-latest
-    env:
-      HUSKY: 0
-    
-    steps:
-      - uses: actions/checkout@v3
-        with:
-          token: ${{{{ secrets.GITHUB_TOKEN }}}}
-          fetch-depth: 0
-      
-      - name: Setup Node.js
-        uses: actions/setup-node@v3
-        with:
-          node-version: '18'
-          cache: 'npm'
-      
-      - name: Cache dependencies
-        uses: actions/cache@v3
-        with:
-          path: |
-            ~/.npm
-            node_modules
-            .next/cache
-          key: ${{{{ runner.os }}}}-deps-${{{{ hashFiles('**/package-lock.json') }}}}
-          restore-keys: |
-            ${{{{ runner.os }}}}-deps-
-      
-      - name: Install dependencies
-        run: npm ci --prefer-offline --no-audit
-      
-      - name: Auto-Fix Linting Issues
-        id: lint-fix
-        run: |
-          echo "🔧 Attempting to auto-fix lint issues..."
-          npm run lint:fix || npx eslint . --fix --ext .js,.jsx,.ts,.tsx || true
-          
-          if git diff --quiet; then
-            echo "✅ No lint issues found or fixed"
-            echo "fixed=false" >> $GITHUB_OUTPUT
-          else
-            echo "🔧 Lint issues were auto-fixed"
-            echo "fixed=true" >> $GITHUB_OUTPUT
-          fi
-      
-      - name: Auto-Fix Prettier Formatting
-        id: prettier-fix
-        run: |
-          echo "🎨 Attempting to auto-fix formatting..."
-          npx prettier --write "**/*.js" "**/*.jsx" "**/*.ts" "**/*.tsx" "**/*.css" "**/*.md" "**/*.json" --ignore-path .gitignore || true
-          
-          if git diff --quiet; then
-            echo "✅ No formatting issues"
-            echo "fixed=false" >> $GITHUB_OUTPUT
-          else
-            echo "🎨 Formatting was auto-fixed"
-            echo "fixed=true" >> $GITHUB_OUTPUT
-          fi
-      
-      - name: Commit Auto-Fixes
-        if: steps.lint-fix.outputs.fixed == 'true' || steps.prettier-fix.outputs.fixed == 'true'
-        run: |
-          git config --global user.email "github-actions[bot]@users.noreply.github.com"
-          git config --global user.name "github-actions[bot]"
-          
-          git add -A
-          git commit -m "🤖 Auto-fix: linting and formatting issues [skip ci]"
-          git push origin "{escaped_branch}"
-      
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v2
-        with:
-          aws-access-key-id: ${{{{ secrets.AWS_ACCESS_KEY_ID }}}}
-          aws-secret-access-key: ${{{{ secrets.AWS_SECRET_ACCESS_KEY }}}}
-          aws-region: {self.aws_region}
-      
-      - name: Deploy backend
-        run: |
-          export CI=1
-          npx ampx pipeline-deploy \\
-            --branch {branch_name} \\
-            --app-id {app_id}
-      
-      - name: Generate Amplify outputs
-        run: |
-          npx ampx generate outputs \\
-            --branch {branch_name} \\
-            --app-id {app_id} \\
-            --format json \\
-            --outputs-version 1.3
-      
-      - name: Commit outputs
-        run: |
-          git config --global user.email "github-actions[bot]@users.noreply.github.com"
-          git config --global user.name "github-actions[bot]"
-          
-          git add -A amplify_outputs.json
-          if ! git diff --cached --quiet; then
-            git commit -m "Update amplify_outputs.json [skip ci]"
-            git push origin "{escaped_branch}"
-          fi
-      
-      - name: Trigger frontend build
-        run: |
-          {('curl -X POST "' + webhook_url + '"') if webhook_url else '# Add webhook URL here - check .amplify-webhook-*.json file'}
-          echo "✅ Deployment complete!"
-"""
+        # Use the new workflow template with credential check
+        workflow = get_workflow_template(app_id, branch_name, self.aws_region)
         
         # Save workflow file
         workflow_dir = Path(repo_path) / '.github' / 'workflows'
@@ -639,14 +518,76 @@ jobs:
                 '✅ Smart error handling and retries'
             ],
             'next_steps': [
-                f"1. Add AWS keys to GitHub: Go to Settings → Secrets → Actions",
-                f"   - Add secret: AWS_ACCESS_KEY_ID",
-                f"   - Add secret: AWS_SECRET_ACCESS_KEY",
+                f"1. Add AWS credentials to THIS repository's GitHub Secrets:",
+                f"   Go to: https://github.com/[owner]/[repo]/settings/secrets/actions",
+                f"   - AWS_ACCESS_KEY_ID (from github-actions-amplify IAM user)",
+                f"   - AWS_SECRET_ACCESS_KEY (from github-actions-amplify IAM user)",
+                f"   ",
+                f"   ⚠️ IMPORTANT: Secrets must be added to EACH repository individually",
+                f"   ✅ TIP: Use the same IAM user credentials for all your projects",
+                f"   ",
                 f"2. (Optional) Add notifications:",
-                f"   - Add secret: SLACK_WEBHOOK_URL for Slack notifications",
-                f"3. That's it! Push code to trigger the pipeline."
+                f"   - SLACK_WEBHOOK_URL for Slack notifications",
+                f"3. Push code to trigger the pipeline."
             ]
         }
+    
+    async def check_and_deploy_backend(self, app_id: str, branch_name: str, repo_path: str) -> Dict[str, Any]:
+        """Check if backend exists and deploy if needed"""
+        logger.info(f"Checking backend status for app {app_id} branch {branch_name}...")
+        
+        # Check if CloudFormation stack exists
+        cmd = [
+            'aws', 'cloudformation', 'describe-stacks',
+            '--stack-name', f'amplify-{app_id}-{branch_name}-branch',
+            '--region', self.aws_region
+        ]
+        
+        result = await self.run_command(cmd)
+        
+        if not result['success']:
+            # Stack doesn't exist, need to deploy backend
+            logger.info("Backend stack not found. Deploying backend...")
+            
+            # Deploy backend using pipeline-deploy
+            deploy_cmd = [
+                'npx', 'ampx', 'pipeline-deploy',
+                '--branch', branch_name,
+                '--app-id', app_id
+            ]
+            
+            # Set CI environment variable
+            env = os.environ.copy()
+            env['CI'] = '1'
+            
+            deploy_result = await asyncio.create_subprocess_exec(
+                *deploy_cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                cwd=repo_path,
+                env=env
+            )
+            stdout, stderr = await deploy_result.communicate()
+            
+            if deploy_result.returncode == 0:
+                return {
+                    'success': True,
+                    'message': 'Backend deployed successfully',
+                    'action': 'deployed'
+                }
+            else:
+                return {
+                    'success': False,
+                    'error': f"Failed to deploy backend: {stderr.decode('utf-8', errors='replace')}",
+                    'hint': 'Ensure you have run npm install and have valid AWS credentials'
+                }
+        else:
+            logger.info("Backend stack already exists")
+            return {
+                'success': True,
+                'message': 'Backend already deployed',
+                'action': 'exists'
+            }
     
     async def setup_custom_pipeline(
         self,
@@ -691,6 +632,19 @@ jobs:
             },
             'steps': []
         }
+        
+        # Step 0: Check and deploy backend if needed
+        logger.info("Checking backend deployment status...")
+        backend_result = await self.check_and_deploy_backend(app_id, branch_name, repo_path)
+        results['steps'].append({
+            'step': 'check_backend',
+            'result': backend_result
+        })
+        
+        if not backend_result['success']:
+            results['success'] = False
+            results['error'] = 'Failed to deploy backend'
+            return results
         
         # Step 1: Disable auto-build
         logger.info(f"Disabling auto-build for {branch_name}...")
@@ -747,8 +701,20 @@ jobs:
             })
         
         results['success'] = True
+        
+        # Include backend deployment status in summary
+        backend_status = ''
+        for step in results['steps']:
+            if step['step'] == 'check_backend':
+                if step['result'].get('action') == 'deployed':
+                    backend_status = '✅ Backend deployed successfully\n'
+                elif step['result'].get('action') == 'exists':
+                    backend_status = '✅ Backend already deployed\n'
+                break
+        
         results['summary'] = (
             f"Custom pipeline setup complete for {branch_name}!\n\n"
+            f"{backend_status}"
             f"✅ Auto-build disabled\n"
             f"✅ Webhook created for frontend triggers\n"
             f"✅ Build spec generated (add to repo as amplify.yml)\n"
