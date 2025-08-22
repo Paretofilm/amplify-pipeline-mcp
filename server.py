@@ -589,6 +589,150 @@ jobs:
                 'action': 'exists'
             }
     
+    async def monitor_github_workflow(
+        self,
+        repo_path: str,
+        timeout_seconds: int = 300,
+        check_interval: int = 10
+    ) -> Dict[str, Any]:
+        """Monitor GitHub Actions workflow after pushing changes"""
+        
+        logger.info("Monitoring GitHub Actions workflow...")
+        
+        # Wait a moment for the workflow to be triggered
+        await asyncio.sleep(5)
+        
+        # Get the latest workflow run
+        cmd = ["gh", "run", "list", "--limit", "1", "--json", "status,conclusion,name,databaseId,url"]
+        result = await self.run_command(cmd, cwd=repo_path)
+        
+        if not result['success']:
+            return {
+                'success': False,
+                'error': 'Failed to get workflow status',
+                'details': result.get('stderr', '')
+            }
+        
+        try:
+            runs = json.loads(result['stdout'])
+            if not runs:
+                return {
+                    'success': False,
+                    'error': 'No workflow runs found'
+                }
+            
+            run = runs[0]
+            run_id = run['databaseId']
+            run_name = run['name']
+            
+            logger.info(f"Monitoring workflow: {run_name} (ID: {run_id})")
+            
+            # Monitor the workflow
+            start_time = asyncio.get_event_loop().time()
+            while asyncio.get_event_loop().time() - start_time < timeout_seconds:
+                # Get current status
+                cmd = ["gh", "run", "view", str(run_id), "--json", "status,conclusion"]
+                result = await self.run_command(cmd, cwd=repo_path)
+                
+                if result['success']:
+                    status_data = json.loads(result['stdout'])
+                    status = status_data.get('status')
+                    conclusion = status_data.get('conclusion')
+                    
+                    if status == 'completed':
+                        if conclusion == 'success':
+                            logger.info("✅ Workflow completed successfully!")
+                            
+                            # Get the summary
+                            cmd = ["gh", "run", "view", str(run_id), "--log"]
+                            log_result = await self.run_command(cmd, cwd=repo_path)
+                            
+                            return {
+                                'success': True,
+                                'conclusion': 'success',
+                                'run_id': run_id,
+                                'message': 'Workflow completed successfully',
+                                'url': run['url']
+                            }
+                        else:
+                            logger.error(f"❌ Workflow failed with conclusion: {conclusion}")
+                            
+                            # Get failed logs
+                            cmd = ["gh", "run", "view", str(run_id), "--log-failed"]
+                            log_result = await self.run_command(cmd, cwd=repo_path)
+                            
+                            # Parse errors and attempt fixes
+                            error_details = log_result.get('stdout', '')
+                            fix_attempted = await self.attempt_auto_fix(repo_path, error_details)
+                            
+                            return {
+                                'success': False,
+                                'conclusion': conclusion,
+                                'run_id': run_id,
+                                'error': f'Workflow failed: {conclusion}',
+                                'error_logs': error_details[:2000] if error_details else None,
+                                'fix_attempted': fix_attempted,
+                                'url': run['url']
+                            }
+                    else:
+                        logger.info(f"Workflow status: {status}")
+                
+                await asyncio.sleep(check_interval)
+            
+            return {
+                'success': False,
+                'error': 'Workflow monitoring timeout',
+                'run_id': run_id,
+                'url': run['url']
+            }
+            
+        except json.JSONDecodeError:
+            return {
+                'success': False,
+                'error': 'Failed to parse workflow status'
+            }
+    
+    async def attempt_auto_fix(self, repo_path: str, error_logs: str) -> Dict[str, Any]:
+        """Attempt to automatically fix common workflow errors"""
+        
+        fixes_applied = []
+        
+        # Check for common errors and apply fixes
+        if "npm ci" in error_logs and "package-lock.json" in error_logs:
+            logger.info("Detected package-lock.json issue, running npm install...")
+            await self.run_command(["npm", "install"], cwd=repo_path)
+            fixes_applied.append("Updated package-lock.json")
+        
+        if "ESLint" in error_logs or "Parsing error" in error_logs:
+            logger.info("Detected linting issues, running auto-fix...")
+            await self.run_command(["npm", "run", "lint", "--", "--fix"], cwd=repo_path)
+            fixes_applied.append("Fixed linting issues")
+        
+        if "amplify_outputs.json" in error_logs:
+            logger.info("Missing amplify_outputs.json detected...")
+            # This would need the app_id and branch_name
+            fixes_applied.append("Note: amplify_outputs.json needs to be generated")
+        
+        if fixes_applied:
+            # Commit and push fixes
+            await self.run_command(["git", "add", "-A"], cwd=repo_path)
+            await self.run_command(
+                ["git", "commit", "-m", f"Auto-fix: {', '.join(fixes_applied)}"],
+                cwd=repo_path
+            )
+            await self.run_command(["git", "push"], cwd=repo_path)
+            
+            return {
+                'fixed': True,
+                'fixes': fixes_applied,
+                'message': 'Fixes applied and pushed. New workflow will be triggered.'
+            }
+        
+        return {
+            'fixed': False,
+            'message': 'No auto-fixable issues detected'
+        }
+    
     async def setup_custom_pipeline(
         self,
         app_id: Optional[str] = None,
@@ -699,6 +843,24 @@ jobs:
                 'step': 'create_auto_fix_on_failure_workflow',
                 'result': failure_workflow_result
             })
+            
+            # Step 7: Monitor the first workflow run
+            logger.info("Monitoring GitHub Actions workflow...")
+            monitor_result = await self.monitor_github_workflow(repo_path)
+            results['steps'].append({
+                'step': 'monitor_workflow',
+                'result': monitor_result
+            })
+            
+            # If workflow failed but was auto-fixed, monitor the new run
+            if not monitor_result['success'] and monitor_result.get('fix_attempted', {}).get('fixed'):
+                logger.info("Auto-fix applied, monitoring new workflow run...")
+                await asyncio.sleep(10)  # Wait for new workflow to trigger
+                monitor_result2 = await self.monitor_github_workflow(repo_path)
+                results['steps'].append({
+                    'step': 'monitor_workflow_after_fix',
+                    'result': monitor_result2
+                })
         
         results['success'] = True
         
@@ -726,6 +888,23 @@ jobs:
                 f"✅ GitHub Actions workflow created with auto-fix capabilities\n"
                 f"✅ Auto-fix on failure workflow created\n"
             )
+            
+            # Add workflow monitoring results to summary
+            for step in results['steps']:
+                if step['step'] == 'monitor_workflow':
+                    monitor_result = step['result']
+                    if monitor_result.get('success'):
+                        results['summary'] += f"✅ Initial workflow run completed successfully\n"
+                    elif monitor_result.get('fix_attempted', {}).get('fixed'):
+                        results['summary'] += f"⚠️ Initial workflow failed but auto-fix was applied\n"
+                    else:
+                        results['summary'] += f"❌ Initial workflow failed - check logs\n"
+                elif step['step'] == 'monitor_workflow_after_fix':
+                    monitor_result = step['result']
+                    if monitor_result.get('success'):
+                        results['summary'] += f"✅ Workflow succeeded after auto-fix\n"
+                    else:
+                        results['summary'] += f"❌ Workflow failed even after auto-fix\n"
         
         return results
 
