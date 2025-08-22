@@ -733,6 +733,88 @@ jobs:
             'message': 'No auto-fixable issues detected'
         }
     
+    async def check_and_sync_package_lock(self, repo_path: str) -> Dict[str, Any]:
+        """Check if package-lock.json is in sync with package.json and fix if needed"""
+        
+        logger.info("Checking package-lock.json sync...")
+        
+        # Check if package.json exists
+        package_json_path = Path(repo_path) / "package.json"
+        package_lock_path = Path(repo_path) / "package-lock.json"
+        
+        if not package_json_path.exists():
+            return {
+                'success': True,
+                'skipped': True,
+                'message': 'No package.json found, skipping check'
+            }
+        
+        # Run npm install with --package-lock-only to check if lock file is in sync
+        cmd = ["npm", "install", "--package-lock-only"]
+        result = await self.run_command(cmd, cwd=repo_path)
+        
+        if not result['success']:
+            # If npm install failed, try to fix it
+            logger.warning("package-lock.json check failed, attempting to fix...")
+            
+            # Run full npm install to regenerate package-lock.json
+            cmd = ["npm", "install"]
+            install_result = await self.run_command(cmd, cwd=repo_path)
+            
+            if not install_result['success']:
+                return {
+                    'success': False,
+                    'error': 'Failed to sync package-lock.json',
+                    'details': install_result.get('stderr', '')
+                }
+        
+        # Check if package-lock.json was modified
+        cmd = ["git", "status", "--porcelain", "package-lock.json"]
+        status_result = await self.run_command(cmd, cwd=repo_path)
+        
+        if status_result['success'] and status_result['stdout'].strip():
+            # package-lock.json was modified, commit the changes
+            logger.info("package-lock.json was out of sync, committing fix...")
+            
+            # Add the file
+            await self.run_command(["git", "add", "package-lock.json"], cwd=repo_path)
+            
+            # Commit the change
+            commit_result = await self.run_command(
+                ["git", "commit", "-m", "Fix: Sync package-lock.json with package.json"],
+                cwd=repo_path
+            )
+            
+            if commit_result['success']:
+                # Push the change
+                push_result = await self.run_command(["git", "push"], cwd=repo_path)
+                
+                if push_result['success']:
+                    return {
+                        'success': True,
+                        'fixed': True,
+                        'message': 'package-lock.json was out of sync and has been fixed and pushed'
+                    }
+                else:
+                    return {
+                        'success': True,
+                        'fixed': True,
+                        'message': 'package-lock.json was fixed locally but not pushed',
+                        'warning': 'Run git push manually to push the fix'
+                    }
+            else:
+                return {
+                    'success': True,
+                    'fixed': True,
+                    'message': 'package-lock.json was fixed but not committed'
+                }
+        
+        return {
+            'success': True,
+            'synced': True,
+            'message': 'package-lock.json is in sync with package.json'
+        }
+    
     async def setup_custom_pipeline(
         self,
         app_id: Optional[str] = None,
@@ -777,7 +859,21 @@ jobs:
             'steps': []
         }
         
-        # Step 0: Check and deploy backend if needed
+        # Step 0: Check and sync package-lock.json FIRST
+        logger.info("Checking package-lock.json sync before deployment...")
+        package_lock_result = await self.check_and_sync_package_lock(repo_path)
+        results['steps'].append({
+            'step': 'check_package_lock',
+            'result': package_lock_result
+        })
+        
+        # If package-lock sync failed completely, stop here
+        if not package_lock_result['success']:
+            results['success'] = False
+            results['error'] = 'Failed to sync package-lock.json'
+            return results
+        
+        # Step 1: Check and deploy backend if needed
         logger.info("Checking backend deployment status...")
         backend_result = await self.check_and_deploy_backend(app_id, branch_name, repo_path)
         results['steps'].append({
@@ -790,7 +886,7 @@ jobs:
             results['error'] = 'Failed to deploy backend'
             return results
         
-        # Step 1: Disable auto-build
+        # Step 2: Disable auto-build
         logger.info(f"Disabling auto-build for {branch_name}...")
         disable_result = await self.disable_auto_build(app_id, branch_name)
         results['steps'].append({
@@ -803,7 +899,7 @@ jobs:
             results['error'] = 'Failed to disable auto-build'
             return results
         
-        # Step 2: Create webhook
+        # Step 3: Create webhook
         logger.info("Creating webhook for frontend triggers...")
         webhook_result = await self.create_webhook(app_id, branch_name)
         results['steps'].append({
@@ -811,7 +907,7 @@ jobs:
             'result': webhook_result
         })
         
-        # Step 3: Update build spec
+        # Step 4: Update build spec
         logger.info("Generating custom build spec...")
         build_spec_result = await self.update_build_spec(app_id)
         results['steps'].append({
@@ -819,7 +915,7 @@ jobs:
             'result': build_spec_result
         })
         
-        # Step 4: Create auto-fix script
+        # Step 5: Create auto-fix script
         logger.info("Creating auto-fix script...")
         auto_fix_result = await self.create_auto_fix_script(repo_path)
         results['steps'].append({
@@ -827,7 +923,7 @@ jobs:
             'result': auto_fix_result
         })
         
-        # Step 5: Create GitHub workflow (if repo path provided)
+        # Step 6: Create GitHub workflow (if repo path provided)
         if repo_path:
             logger.info("Creating GitHub Actions workflow with auto-fix...")
             workflow_result = await self.setup_github_workflow(app_id, branch_name, repo_path)
@@ -836,7 +932,7 @@ jobs:
                 'result': workflow_result
             })
             
-            # Step 6: Create auto-fix on failure workflow
+            # Step 7: Create auto-fix on failure workflow
             logger.info("Creating auto-fix on failure workflow...")
             failure_workflow_result = await self.create_auto_fix_on_failure_workflow(repo_path)
             results['steps'].append({
@@ -844,7 +940,7 @@ jobs:
                 'result': failure_workflow_result
             })
             
-            # Step 7: Monitor the first workflow run
+            # Step 8: Monitor the first workflow run
             logger.info("Monitoring GitHub Actions workflow...")
             monitor_result = await self.monitor_github_workflow(repo_path)
             results['steps'].append({
@@ -864,18 +960,27 @@ jobs:
         
         results['success'] = True
         
-        # Include backend deployment status in summary
+        # Include package-lock and backend deployment status in summary
+        package_lock_status = ''
         backend_status = ''
         for step in results['steps']:
-            if step['step'] == 'check_backend':
+            if step['step'] == 'check_package_lock':
+                result = step['result']
+                if result.get('fixed'):
+                    package_lock_status = '✅ package-lock.json was out of sync and has been fixed\n'
+                elif result.get('synced'):
+                    package_lock_status = '✅ package-lock.json is in sync\n'
+                elif result.get('skipped'):
+                    package_lock_status = ''  # Don't mention if no package.json
+            elif step['step'] == 'check_backend':
                 if step['result'].get('action') == 'deployed':
                     backend_status = '✅ Backend deployed successfully\n'
                 elif step['result'].get('action') == 'exists':
                     backend_status = '✅ Backend already deployed\n'
-                break
         
         results['summary'] = (
             f"Custom pipeline setup complete for {branch_name}!\n\n"
+            f"{package_lock_status}"
             f"{backend_status}"
             f"✅ Auto-build disabled\n"
             f"✅ Webhook created for frontend triggers\n"
