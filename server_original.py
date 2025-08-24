@@ -18,9 +18,7 @@ import asyncio
 from mcp.server import Server
 import mcp.types as types
 import mcp.server.stdio
-from workflow_templates import get_workflow_template
-from deployment_detector import DeploymentDetector
-from deployment_monitor import DeploymentMonitor
+from workflow_template import get_workflow_template
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -32,8 +30,6 @@ class AmplifyPipelineManager:
     
     def __init__(self):
         self.aws_region = os.environ.get('AWS_REGION', 'eu-north-1')
-        self.detector = DeploymentDetector(self.aws_region)
-        self.monitor = DeploymentMonitor(self.aws_region)
     
     def sanitize_filename(self, name: str) -> str:
         """Sanitize a string to be safe for use in filenames"""
@@ -666,31 +662,24 @@ jobs:
             'message': 'Auto-fix on failure workflow created'
         }
     
-    async def setup_github_workflow(self, app_id: str, branch_name: str, repo_path: str, deployment_mode: str = 'auto') -> Dict[str, Any]:
+    async def setup_github_workflow(self, app_id: str, branch_name: str, repo_path: str) -> Dict[str, Any]:
         """Create a GitHub Actions workflow for the custom pipeline with auto-fix capabilities"""
         
-        # Detect deployment mode if auto
-        if deployment_mode == 'auto':
-            detection_result = await self.detector.detect_deployment_mode(app_id, branch_name)
-            deployment_mode = detection_result.get('deployment_mode', 'repository')
-            logger.info(f"Detected deployment mode: {deployment_mode}")
-        
-        # Get webhook info if manual mode (use sanitized names)
+        # Get webhook info if it exists (use sanitized names)
+        safe_app_id = self.sanitize_filename(app_id)
+        safe_branch = self.sanitize_filename(branch_name)
+        webhook_file = Path(repo_path) / f'.amplify-webhook-{safe_app_id}-{safe_branch}.json'
         webhook_url = None
-        if deployment_mode == 'manual':
-            safe_app_id = self.sanitize_filename(app_id)
-            safe_branch = self.sanitize_filename(branch_name)
-            webhook_file = Path(repo_path) / f'.amplify-webhook-{safe_app_id}-{safe_branch}.json'
-            
-            if webhook_file.exists():
-                try:
-                    webhook_data = json.loads(webhook_file.read_text())
-                    webhook_url = webhook_data.get('webhookUrl')
-                except Exception as e:
-                    logger.warning(f"Could not read webhook file: {e}")
         
-        # Use the appropriate workflow template
-        workflow = get_workflow_template(app_id, branch_name, self.aws_region, deployment_mode)
+        if webhook_file.exists():
+            try:
+                webhook_data = json.loads(webhook_file.read_text())
+                webhook_url = webhook_data.get('webhookUrl')
+            except Exception as e:
+                logger.warning(f"Could not read webhook file: {e}")
+        
+        # Use the new workflow template with credential check
+        workflow = get_workflow_template(app_id, branch_name, self.aws_region)
         
         # Save workflow file
         workflow_dir = Path(repo_path) / '.github' / 'workflows'
@@ -711,13 +700,12 @@ jobs:
         return {
             'success': True,
             'workflow_file': str(workflow_file),
-            'deployment_mode': deployment_mode,
-            'message': f"GitHub Actions workflow created at {workflow_file} (Mode: {deployment_mode})",
+            'message': f"GitHub Actions workflow created at {workflow_file}",
             'features': [
                 '✅ Build caching for faster deployments',
                 '✅ Concurrency control to prevent conflicts',
-                '✅ Auto-fix capabilities built-in' if deployment_mode == 'manual' else '✅ Automatic build monitoring',
-                '✅ Smart error handling and retries' if deployment_mode == 'manual' else '✅ Repository-connected optimization'
+                '✅ Auto-fix capabilities built-in',
+                '✅ Smart error handling and retries'
             ],
             'next_steps': [
                 f"1. Add AWS credentials to THIS repository's GitHub Secrets:",
@@ -1152,31 +1140,15 @@ frontend:
             }
         logger.info(f"Using app ID: {app_id}")
         
-        # DETECT DEPLOYMENT MODE AND PREREQUISITES
-        logger.info("Checking deployment prerequisites...")
-        prereq_check = await self.detector.check_deployment_prerequisites(app_id, branch_name, repo_path)
-        deployment_mode = prereq_check['checks']['deployment_mode'].get('deployment_mode', 'repository')
-        
-        logger.info(f"Deployment mode detected: {deployment_mode}")
-        if deployment_mode == 'repository':
-            logger.info("📦 Repository-connected app detected - will use automatic deployments")
-        elif deployment_mode == 'manual':
-            logger.info("🔧 Manual deployment app detected - will use webhook triggers")
-        else:
-            logger.warning("⚠️ Could not determine deployment mode - defaulting to repository-connected")
-            deployment_mode = 'repository'
-        
         results = {
             'app_id': app_id,
             'branch_name': branch_name,
             'repo_path': repo_path,
-            'deployment_mode': deployment_mode,
             'auto_detected': {
                 'app_id': False,  # App ID is never auto-detected
                 'branch_name': branch_name is not None,
                 'repo_path': repo_path == os.getcwd()
             },
-            'prerequisites': prereq_check,
             'steps': []
         }
         
@@ -1215,45 +1187,26 @@ frontend:
             results['error'] = 'Failed to deploy backend'
             return results
         
-        # Step 2: Configure build settings based on deployment mode
-        if deployment_mode == 'manual':
-            # For manual mode, disable auto-build and create webhook
-            logger.info(f"Disabling auto-build for manual deployment mode...")
-            disable_result = await self.disable_auto_build(app_id, branch_name)
-            results['steps'].append({
-                'step': 'disable_auto_build',
-                'result': disable_result
-            })
-            
-            if not disable_result['success']:
-                # Try to continue anyway, might already be disabled
-                logger.warning("Could not disable auto-build, continuing...")
-            
-            # Create webhook for manual triggering
-            logger.info("Creating webhook for manual frontend triggers...")
-            webhook_result = await self.create_webhook(app_id, branch_name)
-            results['steps'].append({
-                'step': 'create_webhook',
-                'result': webhook_result
-            })
-        else:
-            # For repository mode, ensure auto-build is ENABLED
-            logger.info(f"Ensuring auto-build is enabled for repository mode...")
-            enable_cmd = [
-                'aws', 'amplify', 'update-branch',
-                '--app-id', app_id,
-                '--branch-name', branch_name,
-                '--enable-auto-build',
-                '--region', self.aws_region
-            ]
-            enable_result = await self.run_command(enable_cmd)
-            results['steps'].append({
-                'step': 'enable_auto_build',
-                'result': {
-                    'success': enable_result['success'],
-                    'message': 'Auto-build enabled for repository-connected deployment' if enable_result['success'] else 'Could not enable auto-build'
-                }
-            })
+        # Step 2: Disable auto-build
+        logger.info(f"Disabling auto-build for {branch_name}...")
+        disable_result = await self.disable_auto_build(app_id, branch_name)
+        results['steps'].append({
+            'step': 'disable_auto_build',
+            'result': disable_result
+        })
+        
+        if not disable_result['success']:
+            results['success'] = False
+            results['error'] = 'Failed to disable auto-build'
+            return results
+        
+        # Step 3: Create webhook
+        logger.info("Creating webhook for frontend triggers...")
+        webhook_result = await self.create_webhook(app_id, branch_name)
+        results['steps'].append({
+            'step': 'create_webhook',
+            'result': webhook_result
+        })
         
         # Step 4: Update build spec
         logger.info("Generating custom build spec...")
@@ -1273,8 +1226,8 @@ frontend:
         
         # Step 6: Create GitHub workflow (if repo path provided)
         if repo_path:
-            logger.info(f"Creating GitHub Actions workflow for {deployment_mode} mode...")
-            workflow_result = await self.setup_github_workflow(app_id, branch_name, repo_path, deployment_mode)
+            logger.info("Creating GitHub Actions workflow with auto-fix...")
+            workflow_result = await self.setup_github_workflow(app_id, branch_name, repo_path)
             results['steps'].append({
                 'step': 'create_github_workflow',
                 'result': workflow_result
@@ -1400,33 +1353,20 @@ frontend:
                 elif step['result'].get('action') == 'exists':
                     backend_status = '✅ Backend already deployed\n'
         
-        # Build summary based on deployment mode
-        if deployment_mode == 'repository':
-            results['summary'] = (
-                f"Pipeline setup complete for {branch_name} (Repository-Connected Mode)!\n\n"
-                f"{package_lock_status}"
-                f"{amplify_yml_status}"
-                f"{backend_status}"
-                f"✅ Auto-build enabled for automatic deployments\n"
-                f"✅ Repository connection verified\n"
-                f"✅ Build spec configured (amplify.yml)\n"
-                f"✅ Auto-fix script created (scripts/auto-fix.js)\n"
-            )
-        else:
-            results['summary'] = (
-                f"Pipeline setup complete for {branch_name} (Manual Deployment Mode)!\n\n"
-                f"{package_lock_status}"
-                f"{amplify_yml_status}"
-                f"{backend_status}"
-                f"✅ Auto-build disabled for manual control\n"
-                f"✅ Webhook created for frontend triggers\n"
-                f"✅ Build spec generated (amplify.yml)\n"
-                f"✅ Auto-fix script created (scripts/auto-fix.js)\n"
-            )
+        results['summary'] = (
+            f"Custom pipeline setup complete for {branch_name}!\n\n"
+            f"{package_lock_status}"
+            f"{amplify_yml_status}"
+            f"{backend_status}"
+            f"✅ Auto-build disabled\n"
+            f"✅ Webhook created for frontend triggers\n"
+            f"✅ Build spec generated (add to repo as amplify.yml)\n"
+            f"✅ Auto-fix script created (scripts/auto-fix.js)\n"
+        )
         
         if repo_path:
             results['summary'] += (
-                f"✅ GitHub Actions workflow created ({deployment_mode} mode)\n"
+                f"✅ GitHub Actions workflow created with auto-fix capabilities\n"
                 f"✅ Auto-fix on failure workflow created\n"
             )
             
